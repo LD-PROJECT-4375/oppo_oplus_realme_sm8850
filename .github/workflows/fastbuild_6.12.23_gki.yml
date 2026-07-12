@@ -95,10 +95,15 @@ on:
         required: false
         type: string
         default: ''
+      symtypes_debug:
+        description: '生成 gendwarfksyms/symtypes 诊断包（禁用 ccache）'
+        required: true
+        type: boolean
+        default: false
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       ksuver: ${{ steps.ksu_version.outputs.ksuver }}
       ak3name: ${{ steps.create_zip.outputs.ak3name }}
@@ -106,6 +111,10 @@ jobs:
       actions: write
       contents: read
     steps:
+      - name: Checkout diagnostics
+        uses: actions/checkout@v6
+        with:
+          path: workflow_repo
       - name: 安装环境依赖+初始化源码仓库及llvm-clang19工具链
         run: |
           rm -rf kernel_workspace
@@ -658,6 +667,24 @@ jobs:
           export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump OBJSIZE=llvm-size STRIP=llvm-strip
           # 5. 编译前运行官方环境配置脚本
           source "./_setup_env.sh" 2>/dev/null || true
+
+          # 6. 自定义诊断
+          export KBUILD_BUILD_USER=build-user
+          export KBUILD_BUILD_HOST=build-host
+          export KBUILD_BUILD_VERSION=1
+          export KBUILD_BUILD_TIMESTAMP='Thu Jan  1 00:00:00 UTC 1970'
+
+          if [[ "${{ github.event.inputs.symtypes_debug }}" == "true" ]]; then
+            echo "启用路线 B 诊断"
+            export KBUILD_SYMTYPES=1
+            export CCACHE_DISABLE=true
+            if [[ "${{ github.event.inputs.symtypes_debug }}" == "true" ]]; then
+              rm -rf out
+            fi
+          else
+            unset KBUILD_SYMTYPES || true
+            unset CCACHE_DISABLE || true
+          fi
           
           #在构建内核的同时清除不必要的.NET, Android NDK, Haskell, CodeQL运行库，清理空间且不阻塞后续步骤运行
           sudo rm -rf /usr/share/dotnet &
@@ -666,7 +693,18 @@ jobs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL &
           make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="clang" LD="ld.lld" OBJCOPY="llvm-objcopy" O=out gki_defconfig &&
           export CC="$(pwd)/cc-wrapper" && export LD="$(pwd)/ld-wrapper" &&
-          make -j$(nproc --all) LLVM=1 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CC="$(pwd)/cc-wrapper" LD="$(pwd)/ld-wrapper" OBJCOPY="llvm-objcopy" O=out Image
+          
+          make -j"$(nproc --all)" \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CC="$(pwd)/cc-wrapper" \
+            LD="$(pwd)/ld-wrapper" \
+            OBJCOPY=llvm-objcopy \
+            KBUILD_SYMTYPES="${KBUILD_SYMTYPES:-}" \
+            O=out \
+            Image
           
           # 编译后时间劫持二次校验
           echo "--- 编译后环境时间: $(LD_PRELOAD=$PRELOAD_LIBS date) ---"
@@ -684,7 +722,25 @@ jobs:
           ccache -s
           echo "编译后空间:"
           df -h
+      - name: 收集 gendwarfksyms 诊断
+        if: inputs.symtypes_debug
+        run: |
+          chmod +x \
+            "$GITHUB_WORKSPACE/workflow_repo/diagnostics/collect_gendwarf_bundle.sh"
 
+          "$GITHUB_WORKSPACE/workflow_repo/diagnostics/collect_gendwarf_bundle.sh" \
+            "$GITHUB_WORKSPACE/kernel_workspace" \
+            "action-${GITHUB_RUN_ID}"
+
+      - name: 上传 gendwarfksyms 诊断
+        if: inputs.symtypes_debug
+        uses: actions/upload-artifact@v4
+        with:
+          name: gendwarf-action-${{ github.run_id }}
+          path: kernel_workspace/gendwarf-action-${{ github.run_id }}.tar.zst
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
       - name: 保存新的 ccache 缓存
         if: inputs.ccache_update || steps.ccache-restore.outputs.cache-hit != 'true'
         uses: actions/cache/save@v5
