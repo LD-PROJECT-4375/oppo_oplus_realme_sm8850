@@ -1,0 +1,238 @@
+name: Android 16 GKI 6.12.23 Stable Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      builder:
+        description: Build user shown in the kernel banner
+        required: true
+        type: string
+        default: GitHubActions
+      build_host:
+        description: Build host shown in the kernel banner
+        required: true
+        type: string
+        default: GitHub
+      config_source:
+        description: Kernel configuration source
+        required: true
+        type: choice
+        default: reference
+        options:
+          - reference
+          - gki
+      clean_mode:
+        description: Clean mode
+        required: true
+        type: choice
+        default: all
+        options:
+          - all
+          - out
+          - config
+          - none
+      timestamp_mode:
+        description: Timestamp handling
+        required: true
+        type: choice
+        default: fixed
+        options:
+          - none
+          - fixed
+          - fake
+      build_timestamp:
+        description: KBUILD_BUILD_TIMESTAMP
+        required: true
+        type: string
+        default: Thu Jan  1 00:00:00 UTC 1970
+      fake_time:
+        description: FAKETIME value when timestamp_mode=fake
+        required: true
+        type: string
+        default: '@2025-05-25 13:00:00'
+      fake_stat:
+        description: FAKESTAT value when timestamp_mode=fake
+        required: true
+        type: string
+        default: '2025-05-25 12:00:00'
+      log_enabled:
+        description: Save full build log
+        required: true
+        type: boolean
+        default: true
+      use_ccache:
+        description: Use safe ccache mode
+        required: true
+        type: boolean
+        default: true
+      symtypes:
+        description: Generate diagnostic .symtypes files
+        required: true
+        type: boolean
+        default: false
+      include_vmlinux:
+        description: Include the large vmlinux file in the artifact
+        required: true
+        type: boolean
+        default: false
+      verify_symvers:
+        description: Require exact reference vmlinux.symvers
+        required: true
+        type: boolean
+        default: true
+      source_url:
+        description: Kernel source archive URL
+        required: true
+        type: string
+        default: https://github.com/cctv18/android_gki_kernel_common/archive/refs/heads/android16-6.12-2025-06.zip
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gki-6.12.23-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TZ: UTC
+  LC_ALL: C
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  WORKSPACE_ROOT: ${{ github.workspace }}/kernel_workspace
+  DOWNLOAD_CACHE_DIR: ${{ github.workspace }}/kernel_workspace/.cache/downloads
+  CCACHE_DIR: ${{ github.workspace }}/.cache/ccache-gki-6.12.23
+  CCACHE_MAXSIZE: 3G
+
+jobs:
+  build:
+    name: Build bootable GKI
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout build files
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Free runner disk space
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/lib/android \
+            /opt/hostedtoolcache/CodeQL || true
+          df -h
+
+      - name: Install host dependencies
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            aria2 bc binutils bison ca-certificates ccache cpio curl file flex \
+            git libdw-dev libelf-dev libssl-dev lz4 make perl pkg-config \
+            python-is-python3 python3 rsync unzip zip zstd
+
+      - name: Restore toolchain download cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.DOWNLOAD_CACHE_DIR }}
+          key: gki-bootstrap-r536225-rust182-buildtools-${{ runner.os }}-v1
+
+      - name: Restore ccache
+        if: inputs.use_ccache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: gki-ccache-6.12.23-${{ runner.os }}-${{ hashFiles('reference-workflow/config', 'scripts/build_gki.sh') }}
+          restore-keys: |
+            gki-ccache-6.12.23-${{ runner.os }}-
+
+      - name: Prepare workspace
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          rm -rf "$WORKSPACE_ROOT"
+          mkdir -p \
+            "$WORKSPACE_ROOT/scripts" \
+            "$WORKSPACE_ROOT/reference-workflow" \
+            "$DOWNLOAD_CACHE_DIR"
+
+          cp -a scripts/build_gki.sh "$WORKSPACE_ROOT/scripts/"
+          cp -a reference-workflow/config "$WORKSPACE_ROOT/reference-workflow/"
+          cp -a reference-workflow/vmlinux.symvers "$WORKSPACE_ROOT/reference-workflow/"
+
+          if [[ "${{ inputs.timestamp_mode }}" == "fake" ]]; then
+            test -f lib/libfakestat.so
+            test -f lib/libfaketimeMT.so
+            cp -a lib/libfakestat.so lib/libfaketimeMT.so "$WORKSPACE_ROOT/"
+          fi
+
+          chmod +x "$WORKSPACE_ROOT/scripts/build_gki.sh"
+
+      - name: Build kernel
+        id: build
+        shell: bash
+        env:
+          SOURCE_URL: ${{ inputs.source_url }}
+        run: |
+          set -Eeuo pipefail
+
+          args=(
+            --root "$WORKSPACE_ROOT"
+            --bootstrap on
+            --config "${{ inputs.config_source }}"
+            --clean "${{ inputs.clean_mode }}"
+            --builder "${{ inputs.builder }}"
+            --build-host "${{ inputs.build_host }}"
+            --timestamp-mode "${{ inputs.timestamp_mode }}"
+            --timestamp "${{ inputs.build_timestamp }}"
+            --fake-time "${{ inputs.fake_time }}"
+            --fake-stat "${{ inputs.fake_stat }}"
+            --log "${{ inputs.log_enabled }}"
+            --ccache "${{ inputs.use_ccache }}"
+            --symtypes "${{ inputs.symtypes }}"
+            --source-url "$SOURCE_URL"
+            --dist-dir "$WORKSPACE_ROOT/dist"
+          )
+
+          if [[ "${{ inputs.config_source }}" == "reference" &&
+                "${{ inputs.verify_symvers }}" == "true" ]]; then
+            args+=(--verify-symvers on)
+          else
+            args+=(--verify-symvers off)
+          fi
+
+          if [[ "${{ inputs.include_vmlinux }}" == "true" ]]; then
+            args+=(--include-vmlinux)
+          fi
+
+          "$WORKSPACE_ROOT/scripts/build_gki.sh" "${args[@]}"
+
+          artifact_dir="$(readlink -f "$WORKSPACE_ROOT/dist/latest")"
+          test -d "$artifact_dir"
+          echo "artifact_dir=$artifact_dir" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=$(basename "$artifact_dir")" >> "$GITHUB_OUTPUT"
+
+      - name: Verify artifact manifest
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "${{ steps.build.outputs.artifact_dir }}"
+          sha256sum -c SHA256SUMS
+          grep -qx 'kbuild_gendwarfksyms_stable=1' build-info.txt
+          test -s Image
+          test -s config
+          test -s vmlinux.symvers
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.build.outputs.artifact_name }}
+          path: ${{ steps.build.outputs.artifact_dir }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
